@@ -166,6 +166,17 @@ prefix uses the original attention path. The flag requires working XPU flash
 attention support; kernel failures are not caught and retried on Triton. To
 roll back the optimization, restart with `INK2_HYBRID_PREFIX_SDPA=0`.
 
+On a single B70, a matched development run with FP8 KV, CUTLASS and DSpark k=7
+measured the following median cold-prefill rates (three requests per depth):
+
+| Prompt tokens | Hybrid off (tok/s) | Hybrid on (tok/s) | Change |
+|---:|---:|---:|---:|
+| 65,536 | 3,108.0 | 3,436.9 | +10.6% |
+| 131,072 | 2,461.8 | 2,851.7 | +15.8% |
+| 245,760 | 1,812.3 | 2,203.5 | +21.6% |
+
+[Benchmark method, raw measurements and live configuration](https://github.com/mgaruccio/b70-inference/tree/main/results/20261124-inkling2-hybrid-prefix-sdpa).
+
 ## Performance
 
 Development-tier measurements on one Arc Pro B70, single stream, greedy, 256
