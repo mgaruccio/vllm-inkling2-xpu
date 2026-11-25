@@ -145,7 +145,7 @@ from vllm.platforms.xpu import XPUPlatform as p; print('inkling2' in p.supported
 | `-cc.cudagraph_mode=FULL_DECODE_ONLY` | Decode graphs (the name says CUDA; it applies to XPU). |
 | `--max-num-seqs 1` | Conservative quick-start default; C32 was verified separately with the sparse-conv stack below. |
 | `--reasoning-parser inkling`, `--tool-call-parser inkling` | Same parsers as on NVIDIA. |
-| `--speculative-config '{"method":"dspark","num_speculative_tokens":7}'` | DSpark with the bundled `mtp.safetensors` drafter. DSpark requires exactly 7. |
+| `--speculative-config '{"method":"dspark","num_speculative_tokens":7}'` | DSpark with the bundled `mtp.safetensors` drafter. DSpark requires exactly 7. To verify fewer drafts at higher concurrency, see the per-batch-size schedule in the 409K recipe below. |
 
 ### Optional: 409K text-only serving with DSpark and sparse conv history
 
@@ -168,12 +168,36 @@ INK2_SPARSE_CONV_HISTORY=1 INK2_CUTLASS_MOE=1 INK2_HYBRID_PREFIX_SDPA=1 \
   --block-size 64 --gpu-memory-utilization 0.98 \
   --enable-prefix-caching --no-async-scheduling \
   -cc.mode=none -cc.cudagraph_mode=FULL_DECODE_ONLY \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+  --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","num_speculative_tokens_per_batch_size":[[1,2,7],[3,32,3]]}'
 ```
 
 The flag is off by default and requires the patched core. It changes how the short convolutions retain history, not the attention KV format. Keep default prefix retention and no KV connector or microbatching for this recipe. Lower `--max-model-len` if the engine cannot reserve enough KV on your host; do not disable the memory check.
 
 In [development validation](https://github.com/mgaruccio/b70-inference/blob/16e94ad4/results/20261125-inkling2-sparse-conv/README.md), the sparse path improved the effective cache estimate by 22% at the same C32/320K budget. A separate C32/409K deployment completed a **408,744-token input plus 128 output tokens** with zero preemptions and DSpark active. This establishes capacity for one near-limit request, not 32 such requests or long-context answer quality. The pool is shared; don't expect interactive latency alongside a long prefill.
+
+**Per-batch-size DSpark verification.** The drafter always proposes its 7-token block. `num_speculative_tokens_per_batch_size` is a stock vLLM scheduler option that tells the scheduler how many of those drafts to verify:
+
+- 7 when 1–2 requests are running;
+- 3 when 3–32 are running.
+
+Verifying a prefix of the draft keeps rejection sampling lossless. Upstream adaptive verification would choose this automatically, but the Inkling DSpark speculator does not support it.
+
+In a [development ABAB comparison](https://github.com/mgaruccio/b70-inference/blob/3ef8256a/results/20261125-inkling2-draft-length-schedule/README.md) on the 409K/C32 recipe above, the schedule measured:
+
+| Workload | Change | k=7 → schedule (tok/s) |
+|---|---:|---|
+| Chat C8 aggregate output | **+11%** | 283 → 314 |
+| Chat C32 aggregate output | **+19%** | 642 → 766 |
+| `vllm bench serve` random 512/128, C4–C32 | **+10–18%** | |
+| Single-stream C1, short and +30K context | unchanged | 109 and 92 |
+
+Other results:
+
+- Greedy token IDs matched across arms.
+- KV capacity stayed above one 409K request.
+- Exact-match needle retrieval passed at 207K and 388K tokens.
+
+A three-segment schedule, `[[1,2,7],[3,12,4],[13,32,3]]`, captures one more set of decode graphs. It fell 40 tokens short of one 409,000-token request at utilization 0.98. Drop the key to verify all 7 drafts at every batch size.
 
 ### Optional: FP8 KV and hybrid XPU flash prefill
 
