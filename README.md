@@ -150,6 +150,22 @@ from vllm.platforms.xpu import XPUPlatform as p; print('inkling2' in p.supported
 | `--reasoning-parser inkling`, `--tool-call-parser inkling` | Same parsers as on NVIDIA. |
 | `--speculative-config '{"method":"dspark","num_speculative_tokens":7}'` | DSpark with the bundled `mtp.safetensors` drafter. DSpark requires exactly 7. |
 
+### Optional: FP8 KV and hybrid XPU flash prefill
+
+Use `--kv-cache-dtype fp8` (E4M3) to reduce KV memory. Set
+`INK2_HYBRID_PREFIX_SDPA=1` to also route the page-aligned, bias-free prefix of
+eligible single-request global-attention prefill through XPU flash SDPA
+(`aten._scaled_dot_product_flash_attention`, the SYCL-TLA backend, not oneDNN).
+The relative-bias tail still runs on Triton; the partial results are merged using
+FP32 log-sum-exp. This applies to prefill, not decode.
+
+The path reuses a BF16 K/V scratch buffer (up to 16 MiB per device and cache
+geometry); gather, kernel, and merge temporaries can still allocate. Disabling
+the flag (the default), missing CPU sequence-length metadata, or an ineligible
+prefix uses the original attention path. The flag requires working XPU flash
+attention support; kernel failures are not caught and retried on Triton. To
+roll back the optimization, restart with `INK2_HYBRID_PREFIX_SDPA=0`.
+
 ## Performance
 
 Development-tier measurements on one Arc Pro B70, single stream, greedy, 256

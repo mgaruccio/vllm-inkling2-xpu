@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU-runnable unit tests for the opt-in hybrid oneDNN prefix SDPA path."""
+"""CPU unit tests and XPU parity checks for hybrid prefix flash SDPA."""
 
 import os
 from types import SimpleNamespace
@@ -365,6 +365,65 @@ def test_window_gather_and_merge_use_reserved_scratch(monkeypatch):
 
     assert torch.equal(buf[0][:, :448], gather(range(8, sdpa_end)))
     assert torch.equal(buf[0][:, 448:512], gather(range(0, 8))[:, 448:512])
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="requires Intel XPU")
+@pytest.mark.parametrize("offset", [-1, 1])
+@torch.inference_mode()
+def test_xpu_hybrid_prefix_sdpa_page_boundary(monkeypatch, offset):
+    from test_attention import shear_rel_logits
+
+    dev = torch.device("xpu", torch.xpu.current_device())
+    nt = 129
+    window = min(
+        attention._SDPA_WIN_MAX_TOKENS,
+        attention._SDPA_PREFILL_SCRATCH_MAX_BYTES // (4 * KVH * D),
+    )
+    prefix_end = window + PAGE + offset
+    seq_len = prefix_end + nt + REL - 1
+    pages = (seq_len + PAGE - 1) // PAGE
+    rng = torch.Generator().manual_seed(841)
+    block_table = torch.randperm(pages, generator=rng, dtype=torch.int32).to(dev)
+    kv = (
+        torch.randn(pages, KVH, PAGE, 2 * D, generator=rng)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+        .to(dev)
+    )
+    q = torch.randn(nt, H, D, generator=rng).mul_(0.5).to(dev, torch.bfloat16)
+    bias = torch.randn(nt, H, REL, generator=rng).mul_(0.25).to(torch.bfloat16)
+    rel = shear_rel_logits(bias, [(nt, seq_len)], 64, is_local=False).to(dev)
+    md = _make_md(seq_len, nt, block_table)
+    md.query_start_loc = md.query_start_loc.to(dev)
+    md.seq_lens = md.seq_lens.to(dev)
+    layer = _make_layer()
+
+    # Limit test VRAM without changing the SDPA window geometry.
+    monkeypatch.setattr(attention, "_FP8_PREFILL_SCRATCH", {})
+    monkeypatch.setattr(attention, "_FP8_PREFILL_SCRATCH_MAX_BYTES", 16 << 20)
+    monkeypatch.setattr(attention, "_SDPA_PREFILL_SCRATCH", {})
+    calls = []
+    flash = attention._sdpa_flash
+
+    def record_flash(query, key, value, scale):
+        calls.append(key.shape[2])
+        return flash(query, key, value, scale)
+
+    monkeypatch.setattr(attention, "_sdpa_flash", record_flash)
+
+    def run(enabled):
+        monkeypatch.setattr(attention, "_HYBRID_PREFIX_SDPA", enabled)
+        out = torch.full_like(q, torch.nan, dtype=torch.float32)
+        lse = torch.full((H, nt), torch.nan, device=dev)
+        layer._prefill_attention(md, kv, q, rel, out, lse, 0)
+        return out.cpu(), lse.cpu()
+
+    ref_out, ref_lse = run(False)
+    assert not calls
+    out, lse = run(True)
+    assert calls == ([window] if offset < 0 else [window, PAGE])
+    torch.testing.assert_close(lse, ref_lse, atol=2e-3, rtol=1e-5)
+    torch.testing.assert_close(out, ref_out, atol=3e-4, rtol=1e-2)
 
 
 def test_env_flag_defaults_to_off():

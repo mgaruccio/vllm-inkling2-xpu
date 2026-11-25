@@ -89,14 +89,14 @@ def _fp8_prefill_scratch(
 # INK2_HYBRID_PREFIX_SDPA=1 routes the bias-free KV prefix (keys older than
 # rel_extent from the oldest query: [0, K0//page) where
 # K0 = seq_len - nt - rel_extent + 1) of full-attention prefill layers
-# through chunked oneDNN flash SDPA, merged with the Triton relative-bias
+# through chunked XPU flash SDPA, merged with the Triton relative-bias
 # tail via FP32 online softmax (LSE). Default 0 keeps the stock chunked-LSE
 # Triton path for all pages.
 _HYBRID_PREFIX_SDPA = os.environ.get("INK2_HYBRID_PREFIX_SDPA", "0") == "1"
 
 # Shared <= 16 MiB BF16 K/V window scratch for hybrid prefix SDPA, retained
 # for process lifetime: every layer of a page shape reuses one buffer so
-# the per-window gather makes no allocations.
+# the per-window gather can reuse the BF16 K/V destination.
 _SDPA_PREFILL_SCRATCH: dict[tuple[torch.device, int, int, int], torch.Tensor] = {}
 _SDPA_PREFILL_SCRATCH_MAX_BYTES = 16 * 1024 * 1024
 _SDPA_WIN_MAX_TOKENS = 8192
@@ -417,7 +417,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             if _HYBRID_PREFIX_SDPA and not is_local:
                 # The hybrid prefix window scratch is reserved the same way:
                 # startup sizing must include it and the runtime path makes
-                # no per-window allocations.
+                # no runtime allocation of the shared K/V destination.
                 _sdpa_prefill_scratch(
                     self.rel_logits_proj.device,
                     self.num_kv_heads,
@@ -764,7 +764,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
 
                 # The bias-free prefix ([0, K0) where
                 # K0 = seq_len - nt - rel_extent + 1) runs through chunked
-                # oneDNN flash SDPA when INK2_HYBRID_PREFIX_SDPA=1; the tail
+                # XPU flash SDPA when INK2_HYBRID_PREFIX_SDPA=1; the tail
                 # of rel_extent-biased keys stays on the Triton path. Only
                 # full pages go to SDPA: the <page strays below K0 keep the
                 # Triton tail's existing masking. Requires the CPU-metadata
