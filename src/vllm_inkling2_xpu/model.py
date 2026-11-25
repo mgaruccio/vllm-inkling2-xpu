@@ -10,6 +10,7 @@ running partial block. Residual blocks are stored in bf16; mixes are fp32.
 Looped checkpoints (`loop_config`) are `Inkling2LoopModel` (`loop.py`).
 """
 
+import os
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 
@@ -136,6 +137,12 @@ class Inkling2DecoderLayer(nn.Module):
                 kernel_size=config.sconv_kernel_size,
                 prefix=f"{prefix}.conv_state" + (f".pass{p}" if p else ""),
                 replicate_hidden=True,
+                # Omit the new keyword on unpatched vLLM, including clean main.
+                **(
+                    {"sparse_history": True}
+                    if os.environ.get("INK2_SPARSE_CONV_HISTORY") == "1"
+                    else {}
+                ),
             )
             for p in range(num_passes)
         )
