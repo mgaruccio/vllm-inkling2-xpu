@@ -18,7 +18,7 @@ Not affiliated with vLLM, Intel, or Thinking Machines.
 |---|---|
 | GPU | 1x Intel Arc Pro B70 (32 GB, Xe2 / Battlemage) |
 | Host | Ubuntu 26.04.1, kernel 7.0.0-34, `xe` driver |
-| vLLM | main at or after `c32251b5d1` (Inkling 2 Mini, #69028), XPU Docker image; also `3146a9df41` + #69186 from source (2026-11-23) |
+| vLLM | XPU build with Inkling 2 Mini ([#69028](https://github.com/vllm-project/vllm/pull/69028)) and the merged XPU FP32 LM-head path ([#69186](https://github.com/vllm-project/vllm/pull/69186)); the sparse-conv profile below pins an exact revision |
 | PyTorch / Triton | 2.15.0+xpu / 3.9.0+xpu (pinned by vLLM's `requirements/xpu.txt`) |
 | Model | `thinkingmachines/Inkling-2-Mini` (Apache-2.0, ~20 GB download) |
 
@@ -39,10 +39,7 @@ took about 17 minutes on a 72-core host.
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-# Optional, ~45% faster decode (about 40 -> 57 tok/s): XPU fp32 lm_head fast path
-# from open PR #69186. Not needed once that PR is merged.
-git fetch origin pull/69186/head
-git checkout FETCH_HEAD -- vllm/model_executor/layers/logits_processor.py
+# Use upstream main with the merged XPU LM-head fast path (#69186).
 docker build -f docker/Dockerfile.xpu --target vllm-openai -t vllm-xpu:main .
 cd ..
 ```
@@ -146,9 +143,37 @@ from vllm.platforms.xpu import XPUPlatform as p; print('inkling2' in p.supported
 | `--max-model-len 8192` | The default context length does not fit on one B70. Raise it as far as your KV cache allows; the server log reports the KV cache size. |
 | `-cc.mode=none` | `torch.compile` is not supported for this model on XPU. |
 | `-cc.cudagraph_mode=FULL_DECODE_ONLY` | Decode graphs (the name says CUDA; it applies to XPU). |
-| `--max-num-seqs 1` | The configuration that was tuned and validated; batching is untested. |
+| `--max-num-seqs 1` | Conservative quick-start default; C32 was verified separately with the sparse-conv stack below. |
 | `--reasoning-parser inkling`, `--tool-call-parser inkling` | Same parsers as on NVIDIA. |
 | `--speculative-config '{"method":"dspark","num_speculative_tokens":7}'` | DSpark with the bundled `mtp.safetensors` drafter. DSpark requires exactly 7. |
+
+### Optional: 409K text-only serving with DSpark and sparse conv history
+
+Use the [official XPU source-install instructions](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/#intel-xpu) with vLLM pinned as follows. Both commits of [#69444](https://github.com/vllm-project/vllm/pull/69444) are needed; #69186 is already in the base.
+
+```bash
+git clone https://github.com/vllm-project/vllm.git
+git -C vllm checkout --detach 0085facc58dedeef757aca3f51d6508e2ef9b148
+git -C vllm fetch origin refs/pull/69444/head
+git -C vllm cherry-pick 0811005c59b750e63f9bd6658842fa7d529b8e21 34a0975f5c9dcee1c88742aacb38de841c3eb7e2
+```
+
+Install the plugin at `677db18d0129703b529270fe75052272f0e2834a` or newer into the same XPU environment. [Build the CUTLASS Xe2 extension](#optional-cutlass-xe2-expert-kernel-ink2_cutlass_moe1) before enabling it. The verified replay used PyTorch 2.15.0+xpu, Triton 3.9.0+xpu, XPU kernels 0.1.17, and compute-runtime 26.40 on one 32 GB B70, with [Inkling-2-Mini `ed40e7da`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7).
+
+```bash
+INK2_SPARSE_CONV_HISTORY=1 INK2_CUTLASS_MOE=1 INK2_HYBRID_PREFIX_SDPA=1 \
+  vllm serve /path/to/Inkling-2-Mini --host 127.0.0.1 \
+  --language-model-only --dtype bfloat16 --kv-cache-dtype fp8 \
+  --max-model-len 409000 --max-num-seqs 32 --max-num-batched-tokens 2048 \
+  --block-size 64 --gpu-memory-utilization 0.98 \
+  --enable-prefix-caching --no-async-scheduling \
+  -cc.mode=none -cc.cudagraph_mode=FULL_DECODE_ONLY \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+```
+
+The flag is off by default and requires the patched core. It changes how the short convolutions retain history, not the attention KV format. Keep default prefix retention and no KV connector or microbatching for this recipe. Lower `--max-model-len` if the engine cannot reserve enough KV on your host; do not disable the memory check.
+
+In [development validation](https://github.com/mgaruccio/b70-inference/blob/16e94ad4/results/20261125-inkling2-sparse-conv/README.md), the sparse path improved the effective cache estimate by 22% at the same C32/320K budget. A separate C32/409K deployment completed a **408,744-token input plus 128 output tokens** with zero preemptions and DSpark active. This establishes capacity for one near-limit request, not 32 such requests or long-context answer quality. The pool is shared; don't expect interactive latency alongside a long prefill.
 
 ### Optional: FP8 KV and hybrid XPU flash prefill
 
