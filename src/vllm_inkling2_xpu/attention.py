@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inkling2 relative-bias attention with short-conv K/V on Intel XPU."""
 
+import os
 from functools import partial
 from typing import cast
 
@@ -83,6 +84,102 @@ def _fp8_prefill_scratch(
         )
         _FP8_PREFILL_SCRATCH[buf_key] = buf
     return buf
+
+
+# INK2_HYBRID_PREFIX_SDPA=1 routes the bias-free KV prefix (keys older than
+# rel_extent from the oldest query: [0, K0//page) where
+# K0 = seq_len - nt - rel_extent + 1) of full-attention prefill layers
+# through chunked oneDNN flash SDPA, merged with the Triton relative-bias
+# tail via FP32 online softmax (LSE). Default 0 keeps the stock chunked-LSE
+# Triton path for all pages.
+_HYBRID_PREFIX_SDPA = os.environ.get("INK2_HYBRID_PREFIX_SDPA", "0") == "1"
+
+# Shared <= 16 MiB BF16 K/V window scratch for hybrid prefix SDPA, retained
+# for process lifetime: every layer of a page shape reuses one buffer so
+# the per-window gather makes no allocations.
+_SDPA_PREFILL_SCRATCH: dict[tuple[torch.device, int, int, int], torch.Tensor] = {}
+_SDPA_PREFILL_SCRATCH_MAX_BYTES = 16 * 1024 * 1024
+_SDPA_WIN_MAX_TOKENS = 8192
+
+
+def _sdpa_prefill_scratch(
+    device: torch.device,
+    num_kv_heads: int,
+    block_size: int,
+    head_dim: int,
+) -> torch.Tensor | None:
+    """Return the shared BF16 K/V window scratch for hybrid prefix SDPA.
+
+    The buffer is allocated once per ``(device, num_kv_heads, block_size,
+    head_dim)`` as ``(2, num_kv_heads, win, head_dim)`` — K in ``[0]``, V in
+    ``[1]`` — where ``win`` is the largest page-aligned token count inside
+    the <= 16 MiB budget, capped at ``_SDPA_WIN_MAX_TOKENS``. Returns
+    ``None`` where a single page already exceeds the budget.
+    """
+    if block_size % 16 or device.type == "meta":
+        return None
+    tok_bytes = 2 * num_kv_heads * head_dim * 2
+    win_tok = min(_SDPA_WIN_MAX_TOKENS, _SDPA_PREFILL_SCRATCH_MAX_BYTES // tok_bytes)
+    win_tok = (win_tok // block_size) * block_size
+    if not win_tok:
+        return None
+    buf_key = (device, num_kv_heads, block_size, head_dim)
+    buf = _SDPA_PREFILL_SCRATCH.get(buf_key)
+    if buf is None:
+        buf = torch.empty(
+            (2, num_kv_heads, win_tok, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        _SDPA_PREFILL_SCRATCH[buf_key] = buf
+    return buf
+
+
+def _sdpa_flash(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bias-free flash SDPA over one prefix window; returns ``(out, lse)``.
+
+    ``q`` is ``(num_kv_heads, group, nt, head_dim)`` and ``k``/``v`` are
+    ``(num_kv_heads, 1, win, head_dim)``: the ``group`` query heads of each
+    KV head share the window's keys. Every key is strictly older than every
+    query position, so ``is_causal=False``.
+    """
+    if q.device.type == "xpu":
+        # The only SDPA-family op on the XPU build returning a real fp32
+        # LSE (overrideable returns None, efficient returns zeros).
+        out, lse, *_ = torch.ops.aten._scaled_dot_product_flash_attention(
+            q, k, v, dropout_p=0.0, is_causal=False, scale=softmax_scale
+        )
+        return out, lse
+    out, lse = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu(
+        q, k, v, dropout_p=0.0, is_causal=False, scale=softmax_scale
+    )
+    return out, lse
+
+
+def _merge_lse(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    o_other: torch.Tensor,
+    l_other: torch.Tensor,
+    nt: int,
+) -> None:
+    """Merge ``(o_other, l_other)`` into ``(out, lse)`` in place (fp32 LSE)."""
+    l0 = lse[:, :nt]
+    l1 = l_other[:, :nt]
+    m = torch.maximum(l0, l1)
+    m_safe = torch.where(torch.isinf(m), torch.zeros_like(m), m)
+    w0 = torch.exp(l0 - m_safe)
+    w1 = torch.exp(l1 - m_safe)
+    ws = w0 + w1
+    ws_safe = torch.where(ws == 0, torch.ones_like(ws), ws)
+    lse[:, :nt] = torch.where(
+        ws == 0, torch.full_like(m, float("-inf")), m_safe + torch.log(ws_safe)
+    )
+    out[:nt] = out[:nt] * (w0 / ws_safe).t().unsqueeze(-1) + o_other[:nt] * (
+        w1 / ws_safe
+    ).t().unsqueeze(-1)
 
 
 def _single_prefill_seq_len(
@@ -317,6 +414,16 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 vllm_config.cache_config.block_size,
                 2 * self.head_dim,
             )
+            if _HYBRID_PREFIX_SDPA and not is_local:
+                # The hybrid prefix window scratch is reserved the same way:
+                # startup sizing must include it and the runtime path makes
+                # no per-window allocations.
+                _sdpa_prefill_scratch(
+                    self.rel_logits_proj.device,
+                    self.num_kv_heads,
+                    vllm_config.cache_config.block_size,
+                    self.head_dim,
+                )
 
     def process_weights_after_loading(self) -> None:
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
@@ -655,7 +762,93 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                         k_hi_tok=p_hi * page,
                     )
 
-                if n_active <= max_pages:
+                # The bias-free prefix ([0, K0) where
+                # K0 = seq_len - nt - rel_extent + 1) runs through chunked
+                # oneDNN flash SDPA when INK2_HYBRID_PREFIX_SDPA=1; the tail
+                # of rel_extent-biased keys stays on the Triton path. Only
+                # full pages go to SDPA: the <page strays below K0 keep the
+                # Triton tail's existing masking. Requires the CPU-metadata
+                # seq len so this arm adds no device syncs.
+                sdpa_end = 0
+                if (
+                    _HYBRID_PREFIX_SDPA
+                    and not self.is_local
+                    and self.rel_extent
+                    and getattr(md, "single_prefill_seq_len", None) is not None
+                ):
+                    k0_tok = seq_len - nt - self.rel_extent + 1
+                    if k0_tok > 0:
+                        sdpa_end = min(end_page, k0_tok // page)
+                kv_h = kv_cache.shape[1]
+                sdpa_buf = None
+                if sdpa_end and self.num_heads % kv_h == 0:
+                    sdpa_buf = _sdpa_prefill_scratch(
+                        q.device, kv_h, page, self.head_dim
+                    )
+
+                if sdpa_buf is not None:
+                    group = self.num_heads // kv_h
+                    sk, sv = sdpa_buf[0], sdpa_buf[1]
+                    win_pages = sdpa_buf.shape[2] // page
+                    # Batch = one KV head, heads = its query-head group.
+                    q5 = q[:nt].permute(1, 0, 2).view(kv_h, group, nt, self.head_dim)
+                    o_tmp = l_tmp = None
+                    acc = False
+                    for p_lo in range(0, sdpa_end, win_pages):
+                        p_hi = min(p_lo + win_pages, sdpa_end)
+                        cnt = p_hi - p_lo
+                        active = block_table[0, p_lo:p_hi].to(torch.int64)
+                        for s in range(0, cnt, 128):
+                            e = min(s + 128, cnt)
+                            sel = kv_fp8.index_select(0, active[s:e])
+                            lo_tok = s * page
+                            hi_tok = lo_tok + (e - s) * page
+                            kv_shape = (kv_h, e - s, page, self.head_dim)
+                            sk[:, lo_tok:hi_tok].view(kv_shape).copy_(
+                                sel[..., : self.head_dim].transpose(0, 1)
+                            )
+                            sv[:, lo_tok:hi_tok].view(kv_shape).copy_(
+                                sel[..., self.head_dim :].transpose(0, 1)
+                            )
+                        o5, l5 = _sdpa_flash(
+                            q5,
+                            sk[:, : cnt * page].unsqueeze(1),
+                            sv[:, : cnt * page].unsqueeze(1),
+                            self.scaling,
+                        )
+                        if not acc:
+                            out[:nt].copy_(
+                                o5.reshape(self.num_heads, nt, self.head_dim).permute(
+                                    1, 0, 2
+                                )
+                            )
+                            lse[:, :nt].copy_(l5.reshape(self.num_heads, nt))
+                            acc = True
+                        else:
+                            if o_tmp is None:
+                                o_tmp = torch.empty_like(out)
+                                l_tmp = torch.empty_like(lse)
+                            o_tmp[:nt].copy_(
+                                o5.reshape(self.num_heads, nt, self.head_dim).permute(
+                                    1, 0, 2
+                                )
+                            )
+                            l_tmp[:, :nt].copy_(l5.reshape(self.num_heads, nt))
+                            _merge_lse(out, lse, o_tmp, l_tmp, nt)
+                    p_lo = sdpa_end
+                    while p_lo < end_page:
+                        p_hi = min(p_lo + max_pages, end_page)
+                        if o_tmp is None:
+                            o_tmp = torch.empty_like(out)
+                            l_tmp = torch.empty_like(lse)
+                        if not acc:
+                            _run_chunk(p_lo, p_hi, out, lse)
+                            acc = True
+                        else:
+                            _run_chunk(p_lo, p_hi, o_tmp, l_tmp)
+                            _merge_lse(out, lse, o_tmp, l_tmp, nt)
+                        p_lo = p_hi
+                elif n_active <= max_pages:
                     _run_chunk(start_page, end_page, out, lse)
                 else:
                     o_tmp = torch.empty_like(out)
@@ -668,22 +861,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                             first = False
                         else:
                             _run_chunk(p_lo, p_hi, o_tmp, l_tmp)
-                            l0 = lse[:, :nt]
-                            l1 = l_tmp[:, :nt]
-                            m = torch.maximum(l0, l1)
-                            m_safe = torch.where(torch.isinf(m), torch.zeros_like(m), m)
-                            w0 = torch.exp(l0 - m_safe)
-                            w1 = torch.exp(l1 - m_safe)
-                            ws = w0 + w1
-                            ws_safe = torch.where(ws == 0, torch.ones_like(ws), ws)
-                            lse[:, :nt] = torch.where(
-                                ws == 0,
-                                torch.full_like(m, float("-inf")),
-                                m_safe + torch.log(ws_safe),
-                            )
-                            out[:nt] = out[:nt] * (w0 / ws_safe).t().unsqueeze(
-                                -1
-                            ) + o_tmp[:nt] * (w1 / ws_safe).t().unsqueeze(-1)
+                            _merge_lse(out, lse, o_tmp, l_tmp, nt)
                 out[nt:].zero_()
                 lse[:, nt:].zero_()
                 return
